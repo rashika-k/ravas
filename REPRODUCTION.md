@@ -165,14 +165,20 @@ Streaming" remains active but does nothing (the logs show repeated
 "Configuration" stay locked out. The only recovery is to quit and relaunch the
 app completely.
 
-### 8. No built-in microphone or camera on a Mac mini
+### 8. No built-in microphone or camera on a Mac mini; video controls hidden behind "Use Video"
 The original authors used a MacBook Pro; this reproduction runs on a Mac mini
 with no built-in mic or camera. In Configuration, the only audio inputs were
-virtual or loopback devices (`Microsoft Teams Audio`, `BlackHole 2ch`), and
-Video Input / Convert Video was entirely disabled (no camera detected, the
-Detect button did nothing). Audio was only testable once the iPhone's
-Continuity microphone appeared as an input device (see issue 10). **Video
-anonymization (FaceMask / Avatar) has not been tested** for lack of a camera.
+virtual or loopback devices (`Microsoft Teams Audio`, `BlackHole 2ch`) until the
+iPhone's Continuity microphone appeared (see issue 10).
+
+Video was initially thought to be blocked by the missing camera: the Video Input
+box, Convert Video and the **Detect** button were all disabled. The actual cause
+is that these controls are only enabled when **Advanced Settings -> Use Video**
+is ticked (`config_dlg.py`, `_set_video_widgets_enabled`). Nothing in the UI
+says so. Once ticked, Detect found one camera at OpenCV index 0 (the iPhone
+Continuity Camera). The log lines `OpenCV: out device of bound (0-0): 1` and
+`camera failed to properly initialize!` printed for the empty indices 1 and 2
+are harmless probes.
 
 ### 9. Avatar detection looks in the wrong default path
 The logs show on every launch:
@@ -240,6 +246,59 @@ output = Mac mini Speakers (index 3), 16 kHz, no video.
   controlled benchmark. Output quality (how convincing the voice
   conversion sounds) was not evaluated. Video was not run (issue 8).
 
+### 11. FaceMask video output window was black (unresolved)
+With FaceMask selected and "Show Video Output Window (DEBUG)" on, the window
+stayed black while audio worked (voice converted, ~0.19 s latency) and the log
+showed `video_output` emitting a `delay:` line per frame with no errors.
+Running `FaceMask.convert_frame` directly on an all-black frame with no face
+returns an all-white 640x480 image (`face_mask.py` draws on a white background),
+so the converter cannot produce black output. The frames are therefore being
+lost at the display step or the window looked at was not the output window.
+The same "frame" window (`cv.imshow` in the `video_output` child process,
+`video_processor.py`) later displayed the Avatar converter's output correctly,
+so a general macOS child-process `imshow` problem is ruled out. The cause is
+specific to that FaceMask run and is not yet found. To do: rerun FaceMask and
+check what the window shows (expected: white background with a black face
+outline).
+
+## Results: audio plus video with the Avatar converter
+
+Run on 2026-10-04 (about 99 s, 21:13:39 to 21:15:18), Mac mini (M4), iPhone
+Continuity Camera as video input, iPhone Microphone as audio input, Mimi-VC
+voice anonymizer (target voice `norbert`, 15154 target features loaded), Avatar
+video converter with the OpenGL renderer, default avatar.
+
+- Everything started cleanly (audio converter, OpenGL rendering app, sync) and
+  shut down cleanly. The only warnings were the avatar-path warning (issue 9,
+  harmless: the default avatar was used) and two unsupported glTF extensions
+  (`KHR_materials_ior`, `KHR_materials_specular`, "used but not required").
+  The avatar was visible in the debug output window (titled "frame").
+- Subjective quality (single observer, informal): the avatar tracked head
+  movement well and its facial expressions came across well. The converted
+  voice was understandable as a changed voice but the quality was not good
+  (not rated further).
+- Video: about 15 fps (about 1490 frames in the run). Latency (capture
+  timestamp to output write) starts at 0.55 s, falls to a steady **0.12-0.14 s**
+  within about 6 s. There were short excursions: a spike to 1.22 s at 21:13:47
+  that recovered in about 0.3 s, and a rise to about 0.25 s for about 5 s around
+  21:15:03.
+- Audio: starts at 0.48 s, then holds at a steady **0.41-0.43 s** (briefly
+  0.44 s around the same 21:15:03 episode).
+- The converter's own timing (printed at shutdown): face detection 119 fps,
+  rendering 174 fps, detect plus render about 141 fps. This is the per-frame
+  processing cost, well above the 15 fps camera rate, so the video side has a
+  lot of headroom.
+- Audio and video are not aligned: audio arrives about 0.29 s after video, which
+  is likely noticeable as the voice trailing the lips.
+- Compared with the earlier audio-only run (jessica, 5979 features, 0.29-0.30 s)
+  and audio plus FaceMask (0.19-0.20 s), audio latency in this run is higher
+  (0.42 s). `norbert` has a larger feature set than `jessica` (the `.pt` files
+  are about 31 MB vs 12 MB), so one hypothesis is that the voice choice, not the
+  avatar, drives audio latency; this is untested. Each run is a single short
+  session.
+- Not evaluated: CPU and memory use, the Chrome renderer, and any formal rating
+  of voice or avatar quality.
+
 ## Status / remaining work
 
 - [x] Homebrew deps installed (with reboot for `blackhole-2ch`)
@@ -253,8 +312,9 @@ output = Mac mini Speakers (index 3), 16 kHz, no video.
 - [x] `run_gui` launches and streams audio end to end (Mimi-VC, voice
       `jessica`) after reconfiguring devices (issues 6, 10)
 - [x] First latency numbers: ~0.29–0.30 s steady state (see Results)
-- [ ] Video anonymization (FaceMask / Avatar) — blocked on having a camera
-      (issue 8)
+- [x] Video anonymization with the Avatar converter (OpenGL renderer) works end
+      to end (see Results)
+- [ ] FaceMask: black output window, needs retest (issue 11)
 - [ ] Longer / controlled latency benchmark and output-quality check
 - [ ] Other voice anonymizers and target voices (`jeffrey`, `nadine`,
       `norbert`)
