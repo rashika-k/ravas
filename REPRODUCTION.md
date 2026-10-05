@@ -97,6 +97,149 @@ appear to require Ready Player Me's live services. This may still affect
 Flagging this for the mentor regardless, since it's a ticking time bomb for
 anyone trying to extend avatar support.
 
+### 5. Unpinned `onnx-ir` / `onnx` break the Mimi ONNX compile step
+`requirements.txt` pins `onnxscript==0.5.3` but not its transitive
+dependencies, so a fresh install resolves to the newest `onnx-ir==1.0.0` and
+`onnx==1.22.0`. Running `python -m stream_processing.models.mimivc.compile`
+then exported the first model (`SEANetEncoder`) but crashed in
+`torch.onnx.export` with:
+
+```
+onnx_ir.passes.PassError: An error occurred when running the
+'_ConvertVersionPassRequiresInline' pass ...
+ValueError: The model contains functions. The version conversion pass does not
+support functions. Please use `common_passes.InlinePass` ...
+```
+
+`ravas/onnx/` stayed empty. Downgrading only `onnx-ir` (to `0.2.1`) was not
+enough; the same error occurred.
+
+**Fix:**
+```bash
+pip install "onnx-ir==0.1.10" "onnx<1.20"   # resolves to onnx 1.19.1
+python -m stream_processing.models.mimivc.compile
+```
+All 7 models (`encoder`, `encoder_transformer`, `downsample`, `quantization`,
+`upsample`, `decoder_transformer`, `decoder`) then compiled into `ravas/onnx/`
+(`.onnx`, `.onnx.data`, `_args.npy` each) and passed the script's numeric
+checks. Reproducibility concern: the pins in `requirements.txt` are
+incomplete, so the install is not reproducible over time.
+
+### 6. Shipped default config contains the original developer's machine-specific values
+On first launch of `python -m run_gui`, before the main window opens, a dialog
+appears: *"The configuration has some unknown values which may be invalid and
+may cause errors,"* listing:
+
+- `audio.input_device`: `"MacBook Pro-Mikrofon"`
+- `audio.output_device`: `"MacBook Pro-Lautsprecher"`
+- `audio.converter.target_feats_path`: `"./target_feats/knnvc/john.pt"`
+
+**Cause:** the repo ships a default config with values taken from the original
+developer's machine instead of generic defaults. The audio device names are
+German-localized ("Mikrofon", "Lautsprecher"), so they won't match any
+non-German macOS install, not just a differently named device. The
+`target_feats_path` points to a `knnvc` voice-conversion directory that isn't
+in the repo at all; only `target_feats/mimivc/` is bundled (via the install
+script), containing `jessica.pt`, `jeffrey.pt`, `nadine.pt` and `norbert.pt`.
+
+This is the same root issue as the earlier avatar-detection warning in the logs
+(`Could not detect any avatar models (*.glb)... Did not find any at
+rpm/dist/chrome-extension.crx`): the shipped default config and detection
+logic don't account for a fresh clone on a different machine.
+
+**Resolution:** clicking "Yes" to continue is safe; the app still launches.
+The actual fix is to reconfigure in the GUI's Settings tab after launch:
+select the real camera and microphone, set the audio output to the real
+speakers/headphones, and change `audio.converter.target_feats_path` to a
+bundled file, e.g. `./target_feats/mimivc/jessica.pt`.
+
+**Reproducibility concern:** a clean clone is not runnable out of the box
+without manually reconfiguring machine-specific values that should have been
+generic defaults or auto-detected.
+
+### 7. GUI does not reset to idle when `start_streaming()` fails
+When starting a stream throws partway through construction (e.g. a bad audio
+device, see issue 10), the GUI stays in a broken "streaming" state: "Stop
+Streaming" remains active but does nothing (the logs show repeated
+`stop streaming...` calls with no effect), while "Start Streaming" and
+"Configuration" stay locked out. The only recovery is to quit and relaunch the
+app completely.
+
+### 8. No built-in microphone or camera on a Mac mini
+The original authors used a MacBook Pro; this reproduction runs on a Mac mini
+with no built-in mic or camera. In Configuration, the only audio inputs were
+virtual or loopback devices (`Microsoft Teams Audio`, `BlackHole 2ch`), and
+Video Input / Convert Video was entirely disabled (no camera detected, the
+Detect button did nothing). Audio was only testable once the iPhone's
+Continuity microphone appeared as an input device (see issue 10). **Video
+anonymization (FaceMask / Avatar) has not been tested** for lack of a camera.
+
+### 9. Avatar detection looks in the wrong default path
+The logs show on every launch:
+```
+gui.config_items WARNING  Could not detect any avatar models (*.glb), using
+default values instead. Did not find any at
+.../ravas/rpm/dist/chrome-extension.crx
+```
+The detector is pointed at the packed extension (`rpm/dist/chrome-extension.crx`)
+rather than at the bundled avatars in `rpm/public/`. This is separate from the
+camera issue and is the same family of problem as issue 6 (defaults that don't
+fit a fresh clone). It falls back to default values, so it did not block the
+audio run.
+
+### 10. Audio device indices are not stable; wrong device gives a misleading error
+Starting a stream failed with:
+```
+File "audio_processor.py", line 100, in read
+    audio_reader = pyaudio.PyAudio().open(...)
+OSError: [Errno -9998] Invalid number of channels
+```
+Despite the message, the channel count (`channels=1`) and sample rate (16 kHz)
+were fine: `PyAudio.is_format_supported` returned `True` for 16/24/44.1/48 kHz on
+every input device. The real cause was a stale device index. The log reported
+`AUDIO_INPUT=3`, but between selecting devices in Configuration and opening
+the stream, the PortAudio device list had shifted (the iPhone's Continuity
+microphone appeared as index 0), so index 3 became `Mac mini Speakers`, an
+output-only device with 0 input channels. Opening that as an input produces
+`-9998`.
+
+Device list at the time of debugging:
+
+| idx | device | in | out |
+|---|---|---|---|
+| 0 | iPhone Microphone | 1 | 0 |
+| 1 | LS27D36xG (monitor) | 0 | 2 |
+| 2 | BlackHole 2ch | 2 | 2 |
+| 3 | Mac mini Speakers | 0 | 2 |
+| 4 | Microsoft Teams Audio | 1 | 1 |
+
+**Fix:** quit RAVAS fully, relaunch, and re-select the audio devices in
+Settings so the indices match the current device list. Reproducibility
+concern: indices are only valid within one PortAudio session, so config values
+that persist indices or depend on a fixed device order break whenever devices
+connect or disconnect (Bluetooth, Continuity, virtual drivers).
+
+## Results: first successful end-to-end run (audio only)
+
+Run on 2026-10-04, Mac mini (M4), Mimi-VC ONNX voice anonymizer, target voice
+`jessica` (5979 target features loaded), input = iPhone Microphone (index 0),
+output = Mac mini Speakers (index 3), 16 kHz, no video.
+
+- The audio pipeline started cleanly: input, converter, sync and output all
+  initialized, and stopping shut down cleanly (`Data is null, stopping
+  conversion`, `finish audio`). No errors in the log.
+- Latency, from the `delay:` log lines in `audio_processor.py`
+  (`time.time() - tdata[0]`, i.e. capture timestamp to the moment the chunk is
+  written to the output device; output-device buffering is not included):
+  - first chunk: 0.76 s (warm-up)
+  - ramp-down over the first ~10 chunks to 0.4 s, then to ~0.29 s
+  - steady state for the remaining ~13 s of the run: **0.29–0.30 s**, stable,
+    with no growth, so the converter keeps up with real time on this machine
+  - chunks arrive about every 80 ms
+- Caveats: this is one short (~15 s) run, read from the log rather than from a
+  controlled benchmark. Output quality (how convincing the voice
+  conversion sounds) was not evaluated. Video was not run (issue 8).
+
 ## Status / remaining work
 
 - [x] Homebrew deps installed (with reboot for `blackhole-2ch`)
@@ -105,14 +248,16 @@ anyone trying to extend avatar support.
 - [x] Mimi target-speaker features downloaded (`jessica`, `jeffrey`, `nadine`,
       `norbert`)
 - [x] Chrome extension packed (`rpm/dist/chrome-extension.crx`)
-- [ ] Mimi ONNX model compile step (`ravas/onnx/`) — directory exists but is
-      still empty; needs to be rerun
-- [ ] `run_gui` — not yet completed successfully; earlier attempt hit a
-      Chrome "Input directory must exist" error and some unexplained
-      downloads, cause not yet isolated (was initially suspected to be Ready
-      Player Me related — see above, now considered unlikely)
-- [ ] Performance numbers (latency, throughput) — pending a working `run_gui`
-- [ ] Full end-to-end run and results write-up
+- [x] Mimi ONNX model compile step (`ravas/onnx/`) — done after pinning
+      `onnx-ir`/`onnx` (issue 5)
+- [x] `run_gui` launches and streams audio end to end (Mimi-VC, voice
+      `jessica`) after reconfiguring devices (issues 6, 10)
+- [x] First latency numbers: ~0.29–0.30 s steady state (see Results)
+- [ ] Video anonymization (FaceMask / Avatar) — blocked on having a camera
+      (issue 8)
+- [ ] Longer / controlled latency benchmark and output-quality check
+- [ ] Other voice anonymizers and target voices (`jeffrey`, `nadine`,
+      `norbert`)
 
 ## Open questions for the mentor
 
